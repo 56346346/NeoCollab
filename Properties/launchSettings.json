@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Revit2026": {
+      "commandName": "Executable",
+      "executablePath": "C:\\Program Files\\Autodesk\\Revit 2026\\Revit.exe",
+      "commandLineArgs": "/language ENU\r\n",
+      "nativeDebugging": true
+    }
+  }
+}
