@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Analysis;
+using Autodesk.Revit.DB.Plumbing;
 using Microsoft.Extensions.Logging;
 using Autodesk.Revit.DB.Events;
 using Microsoft.Extensions.DependencyInjection;
@@ -724,16 +725,17 @@ namespace NeoCollab
             foreach (var element in addedElements.Concat(modifiedElements))
             {
                 var el = element;
+                var elementTypeName = DetermineTrackedElementType(el);
                 if (!_elementCache.TryGetValue(el.Id, out var meta))
                 {
                     // Get IFC GUID for Solibri deletion support
                     var ifcGuidParam = el.get_Parameter(BuiltInParameter.IFC_GUID);
                     var ifcGuid = ifcGuidParam?.AsString() ?? string.Empty;
-                    
+
                     _elementCache[el.Id] = new ElementMetadata
                     {
                         Id = el.Id,
-                        Type = el.GetType().Name,
+                        Type = elementTypeName,
                         Name = el.Name ?? "Unnamed",
                         Uid = ParameterUtils.GetNeo4jUid(el),
                         IfcGuid = ifcGuid
@@ -742,13 +744,16 @@ namespace NeoCollab
                 else
                 {
                     meta.Name = el.Name ?? meta.Name;
+                    meta.Type = elementTypeName;
                     meta.Uid = ParameterUtils.GetNeo4jUid(el);
-                    
+
                     // Update IFC GUID if not set or if element was modified
-                    if (string.IsNullOrEmpty(meta.IfcGuid))
+                    var ifcGuidParam = el.get_Parameter(BuiltInParameter.IFC_GUID);
+                    var ifcGuidValue = ifcGuidParam?.AsString() ?? string.Empty;
+
+                    if (!string.IsNullOrEmpty(ifcGuidValue))
                     {
-                        var ifcGuidParam = el.get_Parameter(BuiltInParameter.IFC_GUID);
-                        meta.IfcGuid = ifcGuidParam?.AsString() ?? string.Empty;
+                        meta.IfcGuid = ifcGuidValue;
                     }
                 }
             }
@@ -756,6 +761,34 @@ namespace NeoCollab
             {
                 _elementCache.Remove(delId);
             }
+        }
+
+        private static string DetermineTrackedElementType(Element element)
+        {
+            if (element is Wall)
+            {
+                return "Wall";
+            }
+
+            if (element is Autodesk.Revit.DB.Plumbing.Pipe)
+            {
+                return "Pipe";
+            }
+
+            if (element is FamilyInstance fi)
+            {
+                if (fi.Category?.Id.Value == (int)BuiltInCategory.OST_Doors)
+                {
+                    return "Door";
+                }
+
+                if (fi.Category?.Id.Value == (int)BuiltInCategory.OST_GenericModel && ParameterUtils.IsProvisionalSpace(fi))
+                {
+                    return "ProvisionalSpace";
+                }
+            }
+
+            return element?.GetType().Name ?? "Unknown";
         }
         private static List<Element> GetAddedElements(DocumentChangedEventArgs e, Document doc)
         {
@@ -965,14 +998,66 @@ namespace NeoCollab
                 // 2. Änderungen identifizieren
                 var addedIds = e.GetAddedElementIds(filter);
                 var deletedIds = e.GetDeletedElementIds();
-                var deletedUids = deletedIds
-                   .Select(id => _elementCache.TryGetValue(id, out var meta) ? meta.Uid : null)
-                   .Where(uid => !string.IsNullOrEmpty(uid))
-                   .ToList();
-                var deletedIfcGuids = deletedIds
-                   .Select(id => _elementCache.TryGetValue(id, out var meta) ? meta.IfcGuid : null)
-                   .Where(guid => !string.IsNullOrEmpty(guid))
-                   .ToList();
+                var deletedIdList = deletedIds.ToList();
+
+                var deletedElementTypeMap = new Dictionary<long, string>();
+                var deletedElementUidMap = new Dictionary<long, string>();
+                var deletedElementIfcGuidMap = new Dictionary<long, string>();
+
+                foreach (var deletedId in deletedIdList)
+                {
+                    if (_elementCache.TryGetValue(deletedId, out var meta))
+                    {
+                        if (!string.IsNullOrEmpty(meta.Type))
+                        {
+                            deletedElementTypeMap[deletedId.Value] = meta.Type;
+                        }
+
+                        if (!string.IsNullOrEmpty(meta.Uid))
+                        {
+                            deletedElementUidMap[deletedId.Value] = meta.Uid;
+                        }
+
+                        if (!string.IsNullOrEmpty(meta.IfcGuid))
+                        {
+                            deletedElementIfcGuidMap[deletedId.Value] = meta.IfcGuid;
+                        }
+                    }
+                    else
+                    {
+                        var fallbackElement = doc.GetElement(deletedId);
+                        if (fallbackElement != null)
+                        {
+                            var fallbackType = DetermineTrackedElementType(fallbackElement);
+                            if (!string.IsNullOrEmpty(fallbackType))
+                            {
+                                deletedElementTypeMap[deletedId.Value] = fallbackType;
+                            }
+
+                            var fallbackUid = ParameterUtils.GetNeo4jUid(fallbackElement);
+                            if (!string.IsNullOrEmpty(fallbackUid))
+                            {
+                                deletedElementUidMap[deletedId.Value] = fallbackUid;
+                            }
+
+                            var fallbackIfcGuid = fallbackElement.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString() ?? string.Empty;
+                            if (!string.IsNullOrEmpty(fallbackIfcGuid))
+                            {
+                                deletedElementIfcGuidMap[deletedId.Value] = fallbackIfcGuid;
+                            }
+                        }
+                    }
+                }
+
+                var deletedUids = deletedElementUidMap.Values
+                    .Where(uid => !string.IsNullOrEmpty(uid))
+                    .Distinct()
+                    .ToList();
+
+                var deletedIfcGuids = deletedElementIfcGuidMap.Values
+                    .Where(guid => !string.IsNullOrEmpty(guid))
+                    .Distinct()
+                    .ToList();
                 var modifiedIds = e.GetModifiedElementIds(filter);
 
                 Logger.LogToFile($"DOCUMENT CHANGE ANALYSIS: Added={addedIds.Count}, Modified={modifiedIds.Count}, Deleted={deletedIds.Count}", "sync.log");
@@ -981,10 +1066,9 @@ namespace NeoCollab
                     Logger.LogToFile($"DOCUMENT CHANGE DELETED IFC-GUIDs: [{string.Join(", ", deletedIfcGuids)}]", "sync.log");
                     
                     // Store IFC-GUIDs for Solibri deletion
-                    var deletedIdsList = deletedIds.ToList();
-                    for (int i = 0; i < Math.Min(deletedIdsList.Count, deletedIfcGuids.Count); i++)
+                    for (int i = 0; i < Math.Min(deletedIdList.Count, deletedIfcGuids.Count); i++)
                     {
-                        _deletedElementIfcGuids[deletedIdsList[i].Value] = deletedIfcGuids[i];
+                        _deletedElementIfcGuids[deletedIdList[i].Value] = deletedIfcGuids[i];
                     }
                 }
 
@@ -1028,14 +1112,17 @@ namespace NeoCollab
                 Logger.LogToFile($"DOCUMENT CHANGE PROCESSING: Processing {addedElements.Count} added, {modifiedElements.Count} modified, {deletedIds.Count} deleted native elements (NeoCollab elements filtered out)", "sync.log");
 
                 // 5. Element-Cache aktualisieren
-                UpdateElementCache(addedElements, modifiedElements, deletedIds.ToList());
+                UpdateElementCache(addedElements, modifiedElements, deletedIdList);
 
                 // 6. ChangeData erstellen
                 var changeData = new ChangeData
                 {
                     AddedElements = addedElements,
-                    DeletedElementIds = deletedIds.ToList(),
+                    DeletedElementIds = deletedIdList,
                     DeletedUids = deletedUids,
+                    DeletedElementTypes = deletedElementTypeMap,
+                    DeletedElementUidMap = deletedElementUidMap,
+                    DeletedElementIfcGuidsMap = deletedElementIfcGuidMap,
                     ModifiedElements = modifiedElements
                 };
 

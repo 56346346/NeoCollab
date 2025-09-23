@@ -896,12 +896,22 @@ $"d.user = '{ParameterUtils.EscapeForCypher(data.GetValueOrDefault("user", Comma
             return map;
         }
         // �ltere Methode zur Graphaktualisierung, wird f�r Debugzwecke verwendet.
-        public void UpdateGraph(Document doc, List<Element> EnqueuedElements, List<ElementId> deletedElementIds, List<Element> modifiedElements)
+        public void UpdateGraph(Document doc,
+            List<Element> EnqueuedElements,
+            List<ElementId> deletedElementIds,
+            List<Element> modifiedElements,
+            Dictionary<long, string> deletedElementTypes,
+            Dictionary<long, string> deletedElementUids,
+            Dictionary<long, string> deletedElementIfcGuids)
         {
             Debug.WriteLine(" Starting to update Graph...\n");
             // Reset stair numbering for each update run
             _stairCounters.Clear();
             string cy;
+
+            deletedElementTypes ??= new Dictionary<long, string>();
+            deletedElementUids ??= new Dictionary<long, string>();
+            deletedElementIfcGuids ??= new Dictionary<long, string>();
 
             // delete nodes
             foreach (ElementId id in deletedElementIds)
@@ -948,9 +958,32 @@ $"d.user = '{ParameterUtils.EscapeForCypher(data.GetValueOrDefault("user", Comma
                 _cmdManager.cypherCommands.Enqueue(cyDel);
                 Debug.WriteLine("[Neo4j] Node deletion Cypher: " + cyDel);
 
-                // Create ChangeLog for deletion (always create, even if element is null)
-                Logger.LogToFile($"DELETE CHANGELOG: Creating for element {id}", "sync.log");
-                CreateChangeLogForElement(id.Value, "Delete");
+                long idValue = id.Value;
+                deletedElementTypes.TryGetValue(idValue, out string elementType);
+                deletedElementUids.TryGetValue(idValue, out string elementUid);
+                deletedElementIfcGuids.TryGetValue(idValue, out string elementIfcGuid);
+
+                if (e != null)
+                {
+                    elementType = DetermineDeletedElementType(e, elementType);
+
+                    if (string.IsNullOrEmpty(elementUid))
+                    {
+                        elementUid = ParameterUtils.GetNeo4jUid(e);
+                    }
+
+                    if (string.IsNullOrEmpty(elementIfcGuid))
+                    {
+                        elementIfcGuid = e.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString() ?? string.Empty;
+                    }
+                }
+
+                elementType = string.IsNullOrWhiteSpace(elementType) ? null : elementType;
+                elementUid = string.IsNullOrWhiteSpace(elementUid) ? null : elementUid;
+                elementIfcGuid = string.IsNullOrWhiteSpace(elementIfcGuid) ? null : elementIfcGuid;
+
+                Logger.LogToFile($"DELETE CHANGELOG: Creating for element {id} (type={elementType ?? "unknown"}, uid={elementUid ?? "null"}, ifcGuid={elementIfcGuid ?? "null"})", "sync.log");
+                CreateChangeLogForElement(id.Value, "Delete", elementType, elementUid, elementIfcGuid);
 
                 if (e == null)
                 {
@@ -1460,11 +1493,11 @@ $"d.user = '{ParameterUtils.EscapeForCypher(data.GetValueOrDefault("user", Comma
         /// Creates ChangeLog entries for all OTHER sessions when this session modifies an element
         /// CRITICAL FIX: Proper session filtering and synchronous completion
         /// </summary>
-        private void CreateChangeLogForElement(long elementId, string operation)
+        private void CreateChangeLogForElement(long elementId, string operation, string elementType = null, string elementUid = null, string elementIfcGuid = null)
         {
             try
             {
-                Logger.LogToFile($"CHANGELOG CREATION: Creating ChangeLog for element {elementId} with operation {operation}", "sync.log");
+                Logger.LogToFile($"CHANGELOG CREATION: Creating ChangeLog for element {elementId} with operation {operation} (type={elementType ?? "unknown"}, uid={elementUid ?? "null"}, ifcGuid={elementIfcGuid ?? "null"})", "sync.log");
                 
                 // CRITICAL FIX: Get current session and find ALL other sessions from Neo4j (not local SessionManager)
                 string currentSessionId = CommandManager.Instance.SessionId;
@@ -1494,7 +1527,7 @@ $"d.user = '{ParameterUtils.EscapeForCypher(data.GetValueOrDefault("user", Comma
                     {
                         try
                         {
-                            await connector.CreateChangeLogEntryWithRelationshipsAsync(elementId, operation, targetSession);
+                            await connector.CreateChangeLogEntryWithRelationshipsAsync(elementId, operation, targetSession, elementType, elementUid, elementIfcGuid);
                             Logger.LogToFile($"CHANGELOG CREATED: Successfully created ChangeLog for element {elementId} ({operation}) in target session {targetSession}", "sync.log");
                         }
                         catch (Exception ex)
@@ -1515,6 +1548,44 @@ $"d.user = '{ParameterUtils.EscapeForCypher(data.GetValueOrDefault("user", Comma
             {
                 Logger.LogCrash("CreateChangeLogForElement", ex);
             }
+        }
+
+        private static string DetermineDeletedElementType(Element element, string cachedType)
+        {
+            if (!string.IsNullOrEmpty(cachedType))
+            {
+                return cachedType;
+            }
+
+            if (element is Wall)
+            {
+                return "Wall";
+            }
+
+            if (element is Autodesk.Revit.DB.Plumbing.Pipe)
+            {
+                return "Pipe";
+            }
+
+            if (element is FamilyInstance fi)
+            {
+                if (fi.Category?.Id.Value == (int)BuiltInCategory.OST_Doors)
+                {
+                    return "Door";
+                }
+
+                if (fi.Category?.Id.Value == (int)BuiltInCategory.OST_GenericModel && ParameterUtils.IsProvisionalSpace(fi))
+                {
+                    return "ProvisionalSpace";
+                }
+            }
+
+            if (element is MEPCurve mepCurve && mepCurve is Autodesk.Revit.DB.Plumbing.Pipe)
+            {
+                return "Pipe";
+            }
+
+            return cachedType;
         }
     }
 }
