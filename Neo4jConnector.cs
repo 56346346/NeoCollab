@@ -425,7 +425,7 @@ RETURN max(s.lastUpdate) AS lastUpdate";
         /// This is the ONLY method that should be used for creating ChangeLog entries
         /// </summary>
         // Transaction-aware version that reuses existing transaction
-        private async Task CreateChangeLogEntryInTransactionAsync(IAsyncTransaction tx, long elementId, string operation, string sessionId)
+        private async Task CreateChangeLogEntryInTransactionAsync(IAsyncTransaction tx, long elementId, string operation, string sessionId, string elementType = null, string elementUid = null, string elementGuid = null)
         {
             // Skip invalid elementIds
             if (elementId <= 0)
@@ -450,14 +450,20 @@ MERGE (cl:ChangeLog {
     elementId: $eid,
     type: $type
 })
-ON CREATE SET 
+ON CREATE SET
     cl.user = $session,
     cl.timestamp = datetime(),
-    cl.acknowledged = false
-ON MATCH SET 
+    cl.acknowledged = false,
+    cl.elementType = $elementType,
+    cl.elementUid = $elementUid,
+    cl.elementGuid = $elementGuid
+ON MATCH SET
     cl.timestamp = datetime(),
     cl.acknowledged = false,
-    cl.user = $session
+    cl.user = $session,
+    cl.elementType = $elementType,
+    cl.elementUid = $elementUid,
+    cl.elementGuid = $elementGuid
 MERGE (s)-[:HAS_LOG]->(cl)
 
 // Create GOT_CHANGED relationships only for existing elements
@@ -479,7 +485,7 @@ RETURN id(cl) as changeId,
 
             try
             {
-                var result = await tx.RunAsync(cypher, new { session = sessionId, type = operation, eid = elementId });
+                var result = await tx.RunAsync(cypher, new { session = sessionId, type = operation, eid = elementId, elementType, elementUid, elementGuid });
                 
                 if (await result.FetchAsync())
                 {
@@ -581,7 +587,7 @@ RETURN count(cl) as processedChangeLogs,
         /// CENTRAL AND ONLY METHOD: Creates a ChangeLog entry with proper HAS_LOG and GOT_CHANGED relationships
         /// This is the ONLY method that should be used for creating ChangeLog entries
         /// </summary>
-        public async Task CreateChangeLogEntryWithRelationshipsAsync(long elementId, string operation, string targetSessionId)
+        public async Task CreateChangeLogEntryWithRelationshipsAsync(long elementId, string operation, string targetSessionId, string elementType = null, string elementUid = null, string elementGuid = null)
         {
             // Skip invalid elementIds
             if (elementId <= 0)
@@ -616,7 +622,10 @@ CREATE (cl:ChangeLog {
     type: $type,
     elementId: $eid,
     acknowledged: false,
-    op: $type
+    op: $type,
+    elementType: $elementType,
+    elementUid: $elementUid,
+    elementGuid: $elementGuid
 })
 MERGE (targetSession)-[:HAS_LOG]->(cl)
 
@@ -635,7 +644,7 @@ FOREACH (ignored IN CASE WHEN $type = 'Delete' AND wall IS NULL AND door IS NULL
   SET cl.deleteProcessed = true
 )
 
-RETURN id(cl) as changeId, 
+RETURN id(cl) as changeId,
        $targetSession as targetSession,
        $originalSession as originalSession,
        CASE WHEN wall IS NOT NULL THEN 'Wall' ELSE null END as wall_found,
@@ -643,16 +652,22 @@ RETURN id(cl) as changeId,
        CASE WHEN pipe IS NOT NULL THEN 'Pipe' ELSE null END as pipe_found,
        CASE WHEN space IS NOT NULL THEN 'ProvisionalSpace' ELSE null END as space_found,
        CASE WHEN level IS NOT NULL THEN 'Level' ELSE null END as level_found,
-       CASE WHEN building IS NOT NULL THEN 'Building' ELSE null END as building_found";
+       CASE WHEN building IS NOT NULL THEN 'Building' ELSE null END as building_found,
+       cl.elementType as changeLogElementType,
+       cl.elementUid as changeLogElementUid,
+       cl.elementGuid as changeLogElementGuid";
 
             try
             {
                 await using var session = _driver.AsyncSession();
-                var result = await session.RunAsync(cypher, new { 
-                    targetSession = targetSessionId, 
-                    originalSession = originalSessionId, 
-                    type = operation, 
-                    eid = elementId 
+                var result = await session.RunAsync(cypher, new {
+                    targetSession = targetSessionId,
+                    originalSession = originalSessionId,
+                    type = operation,
+                    eid = elementId,
+                    elementType,
+                    elementUid,
+                    elementGuid
                 });
                 
                 // CRITICAL: Cypher should ALWAYS return a result since we CREATE the ChangeLog
@@ -670,7 +685,11 @@ RETURN id(cl) as changeId,
                 var elementTypes = new[] { wallFound, doorFound, pipeFound, spaceFound, levelFound, buildingFound }.Where(t => t != null).ToArray();
                 var foundElements = elementTypes.Any() ? string.Join(", ", elementTypes) : "NEW_ELEMENT";
                 
-                Logger.LogToFile($"CHANGELOG CREATION SUCCESS: ChangeLog {changeId} created for elementId {elementId} ({operation}) - targetSession: {targetSession}, originalSession: {originalSession}, elements: {foundElements}", "sync.log");
+                var changeLogElementType = record["changeLogElementType"]?.As<string>();
+                var changeLogElementUid = record["changeLogElementUid"]?.As<string>();
+                var changeLogElementGuid = record["changeLogElementGuid"]?.As<string>();
+
+                Logger.LogToFile($"CHANGELOG CREATION SUCCESS: ChangeLog {changeId} created for elementId {elementId} ({operation}) - targetSession: {targetSession}, originalSession: {originalSession}, elements: {foundElements}, typeMeta={changeLogElementType ?? "null"}, uidMeta={changeLogElementUid ?? "null"}, guidMeta={changeLogElementGuid ?? "null"}", "sync.log");
             }
             catch (Exception ex)
             {
@@ -991,9 +1010,10 @@ RETURN ps";
                     OPTIONAL MATCH (ps:ProvisionalSpace) WHERE ps.elementId = c.elementId
                     WITH c, w, d, p, ps
                     WHERE w IS NOT NULL OR d IS NOT NULL OR p IS NOT NULL OR ps IS NOT NULL OR c.type = 'Delete'
-                    RETURN id(c) AS changeId, c.type AS op, c.elementId AS elementId, 
+                    RETURN id(c) AS changeId, c.type AS op, c.elementId AS elementId,
                            c.targetSessionId AS targetSessionId, c.originalSessionId AS originalSessionId,
-                           w AS wall, d AS door, p AS pipe, ps AS provisionalSpace
+                           w AS wall, d AS door, p AS pipe, ps AS provisionalSpace,
+                           c.elementType AS changeLogElementType, c.elementUid AS changeLogElementUid, c.elementGuid AS changeLogElementGuid
                     ORDER BY c.timestamp ASC";
 
                 var result = await RunQueryAsync(cypher, new { sessionId }, record =>
@@ -1012,10 +1032,10 @@ RETURN ps";
                     {
                         // Check which type of node we have and extract properties
                         var wallNode = record["wall"]?.As<INode>();
-                        var doorNode = record["door"]?.As<INode>(); 
+                        var doorNode = record["door"]?.As<INode>();
                         var pipeNode = record["pipe"]?.As<INode>();
                         var provisionalSpaceNode = record["provisionalSpace"]?.As<INode>();
-                        
+
                         if (wallNode?.Properties != null)
                         {
                             elementProperties = wallNode.Properties.ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -1069,10 +1089,42 @@ RETURN ps";
                         elementProperties["elementId"] = elementId;
                         elementProperties["__element_type__"] = "Unknown";
                     }
-                    
+
+                    var changeLogElementType = record["changeLogElementType"]?.As<string>();
+                    if (!string.IsNullOrEmpty(changeLogElementType))
+                    {
+                        elementProperties["elementType"] = changeLogElementType;
+                        elementProperties["__changeLogElementType__"] = changeLogElementType;
+                        elementProperties["__element_type__"] = changeLogElementType;
+                    }
+
+                    var changeLogElementUid = record["changeLogElementUid"]?.As<string>();
+                    if (!string.IsNullOrEmpty(changeLogElementUid))
+                    {
+                        elementProperties["elementUid"] = changeLogElementUid;
+                        if (!elementProperties.ContainsKey("uid") || string.IsNullOrEmpty(elementProperties["uid"]?.ToString()))
+                        {
+                            elementProperties["uid"] = changeLogElementUid;
+                        }
+                    }
+
+                    var changeLogElementGuid = record["changeLogElementGuid"]?.As<string>();
+                    if (!string.IsNullOrEmpty(changeLogElementGuid))
+                    {
+                        elementProperties["elementGuid"] = changeLogElementGuid;
+                        if (!elementProperties.ContainsKey("guid") || string.IsNullOrEmpty(elementProperties["guid"]?.ToString()))
+                        {
+                            elementProperties["guid"] = changeLogElementGuid;
+                        }
+                        if (!elementProperties.ContainsKey("ifcGuid") || string.IsNullOrEmpty(elementProperties["ifcGuid"]?.ToString()))
+                        {
+                            elementProperties["ifcGuid"] = changeLogElementGuid;
+                        }
+                    }
+
                     // Ensure elementId is always present and correct
                     elementProperties["elementId"] = elementId;
-                    
+
                     // ENHANCED SCHEMA: Add session attribution to element properties
                     elementProperties["__targetSessionId__"] = targetSessionId;
                     elementProperties["__originalSessionId__"] = originalSessionId;

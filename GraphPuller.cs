@@ -189,7 +189,7 @@ public class GraphPuller
                                     else
                                     {
                                         Logger.LogToFile($"Delete: Fallback to ElementId-based deletion for {elementType} {elementId}", "sync.log");
-                                        DeleteElementByRemoteElementId(doc, elementId, elementType);
+                                        DeleteElementByRemoteElementId(doc, elementId, elementType, elementProperties);
                                     }
                                 }
                                 Logger.LogToFile($"Successfully processed delete operation for {elementType} {elementId}", "sync.log");
@@ -857,6 +857,108 @@ public class GraphPuller
         return null;
     }
 
+    private string GetStringProperty(Dictionary<string, object> properties, params string[] keys)
+    {
+        if (properties == null || keys == null)
+        {
+            return string.Empty;
+        }
+
+        foreach (var key in keys)
+        {
+            if (!string.IsNullOrEmpty(key) && properties.TryGetValue(key, out var value) && value != null)
+            {
+                var str = value.ToString();
+                if (!string.IsNullOrWhiteSpace(str))
+                {
+                    return str;
+                }
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private T FindElementByUid<T>(Document doc, string uid) where T : Element
+    {
+        if (string.IsNullOrEmpty(uid))
+        {
+            return null;
+        }
+
+        try
+        {
+            var elements = new FilteredElementCollector(doc).OfClass(typeof(T)).Cast<T>();
+            foreach (var element in elements)
+            {
+                try
+                {
+                    var neoUid = ParameterUtils.GetNeo4jUid(element);
+                    if (!string.IsNullOrEmpty(neoUid) && neoUid.Equals(uid, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return element;
+                    }
+
+                    if (!string.IsNullOrEmpty(element.UniqueId) && element.UniqueId.Equals(uid, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return element;
+                    }
+
+                    var comment = element.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.AsString();
+                    if (!string.IsNullOrEmpty(comment) && comment.IndexOf(uid, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return element;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogToFile($"FIND ELEMENT BY UID WARNING: {ex.Message}", "sync.log");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogToFile($"FIND ELEMENT BY UID ERROR: {ex.Message}", "sync.log");
+        }
+
+        return null;
+    }
+
+    private T FindElementByIfcGuid<T>(Document doc, string guid) where T : Element
+    {
+        if (string.IsNullOrEmpty(guid))
+        {
+            return null;
+        }
+
+        try
+        {
+            var elements = new FilteredElementCollector(doc).OfClass(typeof(T)).Cast<T>();
+            foreach (var element in elements)
+            {
+                try
+                {
+                    var guidParam = element.get_Parameter(BuiltInParameter.IFC_GUID);
+                    var guidValue = guidParam?.AsString();
+                    if (!string.IsNullOrEmpty(guidValue) && guidValue.Equals(guid, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return element;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogToFile($"FIND ELEMENT BY GUID WARNING: {ex.Message}", "sync.log");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogToFile($"FIND ELEMENT BY GUID ERROR: {ex.Message}", "sync.log");
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Automatically joins a wall with nearby walls to prevent overlap conflicts
     /// </summary>
@@ -1326,6 +1428,24 @@ public class GraphPuller
     /// </summary>
     private string DetermineElementType(Dictionary<string, object> properties)
     {
+        if (properties.TryGetValue("elementType", out var elementTypeObj))
+        {
+            var elementType = elementTypeObj?.ToString();
+            if (!string.IsNullOrEmpty(elementType) && elementType != "Unknown")
+            {
+                return elementType;
+            }
+        }
+
+        if (properties.TryGetValue("__changeLogElementType__", out var changeLogTypeObj))
+        {
+            var changeLogType = changeLogTypeObj?.ToString();
+            if (!string.IsNullOrEmpty(changeLogType) && changeLogType != "Unknown")
+            {
+                return changeLogType;
+            }
+        }
+
         // Check for explicit type from Neo4j query first
         if (properties.ContainsKey("__element_type__"))
         {
@@ -1595,7 +1715,7 @@ public class GraphPuller
     /// <summary>
     /// Delete element by remote ElementId based on type
     /// </summary>
-    private void DeleteElementByRemoteElementId(Document doc, int remoteElementId, string elementType)
+    private void DeleteElementByRemoteElementId(Document doc, int remoteElementId, string elementType, Dictionary<string, object> properties)
     {
         switch (elementType)
         {
@@ -1606,10 +1726,10 @@ public class GraphPuller
                 DeleteDoorByRemoteElementId(doc, remoteElementId);
                 break;
             case "Pipe":
-                DeletePipeByRemoteElementId(doc, remoteElementId);
+                DeletePipeByRemoteElementId(doc, remoteElementId, properties);
                 break;
             case "ProvisionalSpace":
-                DeleteProvisionalSpaceByRemoteElementId(doc, remoteElementId);
+                DeleteProvisionalSpaceByRemoteElementId(doc, remoteElementId, properties);
                 break;
             default:
                 Logger.LogToFile($"WARNING: Unknown element type {elementType} for deletion", "sync.log");
@@ -2570,49 +2690,78 @@ public class GraphPuller
         }
     }
 
-    private void DeletePipeByRemoteElementId(Document doc, int remoteElementId)
+    private void DeletePipeByRemoteElementId(Document doc, int remoteElementId, Dictionary<string, object> properties)
     {
         try
         {
             Pipe pipe = FindElementByRemoteElementId<Pipe>(doc, remoteElementId);
+            string remoteUid = GetStringProperty(properties, "elementUid", "uid");
+            string remoteGuid = GetStringProperty(properties, "elementGuid", "guid", "ifcGuid");
+
+            if (pipe == null && !string.IsNullOrEmpty(remoteUid))
+            {
+                pipe = FindElementByUid<Pipe>(doc, remoteUid);
+                if (pipe != null)
+                {
+                    Logger.LogToFile($"PIPE DELETE: Found pipe by UID {remoteUid}", "sync.log");
+                }
+            }
+
+            if (pipe == null && !string.IsNullOrEmpty(remoteGuid))
+            {
+                pipe = FindElementByIfcGuid<Pipe>(doc, remoteGuid);
+                if (pipe != null)
+                {
+                    Logger.LogToFile($"PIPE DELETE: Found pipe by GUID {remoteGuid}", "sync.log");
+                }
+            }
+
+            string solibriGuid = remoteGuid;
             if (pipe != null)
             {
                 // Get pipe GUID for Solibri deletion before deleting from Revit
                 var pipeGuidParam = pipe.get_Parameter(BuiltInParameter.IFC_GUID);
                 var pipeGuid = pipeGuidParam?.AsString();
-                
-                Logger.LogToFile($"PIPE DELETE: Deleting pipe ElementId={pipe.Id} for remoteElementId={remoteElementId}", "sync.log");
-                doc.Delete(pipe.Id);
-                
-                // Delete from Solibri if we have a GUID
                 if (!string.IsNullOrEmpty(pipeGuid))
                 {
-                    try
-                    {
-                        Logger.LogToFile($"DELETE BY ELEMENT ID: Deleting pipe component from Solibri with GUID {pipeGuid}", "sync.log");
-                        
-                        Task.Run(async () =>
-                        {
-                            try
-                            {
-                                await _solibriValidationService.DeleteComponentsAsync(new List<string> { pipeGuid });
-                                Logger.LogToFile($"DELETE BY ELEMENT ID: Successfully deleted pipe component from Solibri", "sync.log");
-                            }
-                            catch (Exception ex)
-                            {
-                                Logger.LogToFile($"DELETE BY ELEMENT ID: Failed to delete pipe component from Solibri: {ex.Message}", "sync.log");
-                            }
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogToFile($"DELETE BY ELEMENT ID: Error initiating Solibri pipe deletion: {ex.Message}", "sync.log");
-                    }
+                    solibriGuid = pipeGuid;
                 }
+
+                Logger.LogToFile($"PIPE DELETE: Deleting pipe ElementId={pipe.Id} for remoteElementId={remoteElementId}", "sync.log");
+                doc.Delete(pipe.Id);
             }
             else
             {
                 Logger.LogToFile($"PIPE DELETE: Pipe not found for remoteElementId={remoteElementId}", "sync.log");
+            }
+
+            if (!string.IsNullOrEmpty(solibriGuid))
+            {
+                try
+                {
+                    Logger.LogToFile($"DELETE BY ELEMENT ID: Deleting pipe component from Solibri with GUID {solibriGuid}", "sync.log");
+
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _solibriValidationService.DeleteComponentsAsync(new List<string> { solibriGuid });
+                            Logger.LogToFile($"DELETE BY ELEMENT ID: Successfully deleted pipe component from Solibri", "sync.log");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogToFile($"DELETE BY ELEMENT ID: Failed to delete pipe component from Solibri: {ex.Message}", "sync.log");
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogToFile($"DELETE BY ELEMENT ID: Error initiating Solibri pipe deletion: {ex.Message}", "sync.log");
+                }
+            }
+            else
+            {
+                Logger.LogToFile($"DELETE BY ELEMENT ID: No GUID available to delete pipe from Solibri (remoteElementId={remoteElementId})", "sync.log");
             }
         }
         catch (Exception ex)
@@ -3593,49 +3742,78 @@ public class GraphPuller
         }
     }
 
-    private void DeleteProvisionalSpaceByRemoteElementId(Document doc, int remoteElementId)
+    private void DeleteProvisionalSpaceByRemoteElementId(Document doc, int remoteElementId, Dictionary<string, object> properties)
     {
         try
         {
             FamilyInstance space = FindElementByRemoteElementId<FamilyInstance>(doc, remoteElementId);
+            string remoteUid = GetStringProperty(properties, "elementUid", "uid", "guid");
+            string remoteGuid = GetStringProperty(properties, "elementGuid", "guid", "ifcGuid");
+
+            if (space == null && !string.IsNullOrEmpty(remoteUid))
+            {
+                space = FindElementByUid<FamilyInstance>(doc, remoteUid);
+                if (space != null)
+                {
+                    Logger.LogToFile($"PROVISIONALSPACE DELETE: Found provisional space by UID {remoteUid}", "sync.log");
+                }
+            }
+
+            if (space == null && !string.IsNullOrEmpty(remoteGuid))
+            {
+                space = FindElementByIfcGuid<FamilyInstance>(doc, remoteGuid);
+                if (space != null)
+                {
+                    Logger.LogToFile($"PROVISIONALSPACE DELETE: Found provisional space by GUID {remoteGuid}", "sync.log");
+                }
+            }
+
+            string solibriGuid = remoteGuid;
             if (space != null)
             {
                 // Get provisional space GUID for Solibri deletion before deleting from Revit
                 var spaceGuidParam = space.get_Parameter(BuiltInParameter.IFC_GUID);
                 var spaceGuid = spaceGuidParam?.AsString();
-                
-                Logger.LogToFile($"PROVISIONALSPACE DELETE: Deleting provisional space ElementId={space.Id} for remoteElementId={remoteElementId}", "sync.log");
-                doc.Delete(space.Id);
-                
-                // Delete from Solibri if we have a GUID
                 if (!string.IsNullOrEmpty(spaceGuid))
                 {
-                    try
-                    {
-                        Logger.LogToFile($"DELETE BY ELEMENT ID: Deleting provisional space component from Solibri with GUID {spaceGuid}", "sync.log");
-                        
-                        Task.Run(async () =>
-                        {
-                            try
-                            {
-                                await _solibriValidationService.DeleteComponentsAsync(new List<string> { spaceGuid });
-                                Logger.LogToFile($"DELETE BY ELEMENT ID: Successfully deleted provisional space component from Solibri", "sync.log");
-                            }
-                            catch (Exception ex)
-                            {
-                                Logger.LogToFile($"DELETE BY ELEMENT ID: Failed to delete provisional space component from Solibri: {ex.Message}", "sync.log");
-                            }
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogToFile($"DELETE BY ELEMENT ID: Error initiating Solibri provisional space deletion: {ex.Message}", "sync.log");
-                    }
+                    solibriGuid = spaceGuid;
                 }
+
+                Logger.LogToFile($"PROVISIONALSPACE DELETE: Deleting provisional space ElementId={space.Id} for remoteElementId={remoteElementId}", "sync.log");
+                doc.Delete(space.Id);
             }
             else
             {
                 Logger.LogToFile($"PROVISIONALSPACE DELETE: Provisional space not found for remoteElementId={remoteElementId}", "sync.log");
+            }
+
+            if (!string.IsNullOrEmpty(solibriGuid))
+            {
+                try
+                {
+                    Logger.LogToFile($"DELETE BY ELEMENT ID: Deleting provisional space component from Solibri with GUID {solibriGuid}", "sync.log");
+
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _solibriValidationService.DeleteComponentsAsync(new List<string> { solibriGuid });
+                            Logger.LogToFile($"DELETE BY ELEMENT ID: Successfully deleted provisional space component from Solibri", "sync.log");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogToFile($"DELETE BY ELEMENT ID: Failed to delete provisional space component from Solibri: {ex.Message}", "sync.log");
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogToFile($"DELETE BY ELEMENT ID: Error initiating Solibri provisional space deletion: {ex.Message}", "sync.log");
+                }
+            }
+            else
+            {
+                Logger.LogToFile($"DELETE BY ELEMENT ID: No GUID available to delete provisional space from Solibri (remoteElementId={remoteElementId})", "sync.log");
             }
         }
         catch (Exception ex)

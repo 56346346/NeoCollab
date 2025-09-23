@@ -45,7 +45,10 @@ namespace NeoCollab
                     _extractor.UpdateGraph(doc,
                                            change.AddedElements,
                                            change.DeletedElementIds,
-                                           change.ModifiedElements);
+                                           change.ModifiedElements,
+                                           change.DeletedElementTypes,
+                                           change.DeletedElementUidMap,
+                                           change.DeletedElementIfcGuidsMap);
                 }
 
                 // CRITICAL FIX: Immediately push cypher commands to Neo4j after UpdateGraph
@@ -303,6 +306,9 @@ MERGE (e)-[:HAS_ISSUE]->(i)";
         public List<Element> AddedElements { get; set; } = new List<Element>();
         public List<ElementId> DeletedElementIds { get; set; } = new List<ElementId>();
         public List<string> DeletedUids { get; set; } = new List<string>();
+        public Dictionary<long, string> DeletedElementTypes { get; set; } = new Dictionary<long, string>();
+        public Dictionary<long, string> DeletedElementUidMap { get; set; } = new Dictionary<long, string>();
+        public Dictionary<long, string> DeletedElementIfcGuidsMap { get; set; } = new Dictionary<long, string>();
 
         public List<Element> ModifiedElements { get; set; } = new List<Element>();
     }
